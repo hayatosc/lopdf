@@ -77,6 +77,7 @@ impl Document {
     fn load_internal<R: Read>(mut source: R, capacity: Option<usize>, options: LoadOptions) -> Result<Document> {
         let mut buffer = capacity.map(Vec::with_capacity).unwrap_or_default();
         source.read_to_end(&mut buffer)?;
+        let max_xref_entries = options.max_xref_entries;
 
         Reader {
             buffer: &buffer,
@@ -87,7 +88,7 @@ impl Document {
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
         }
-        .read(options.filter)
+        .read_with_xref_entry_limit(options.filter, max_xref_entries)
     }
 
     /// Load a PDF document from a memory slice.
@@ -97,6 +98,7 @@ impl Document {
 
     /// Load a PDF document from a memory slice with the given options.
     pub fn load_mem_with_options(buffer: &[u8], options: LoadOptions) -> Result<Document> {
+        let max_xref_entries = options.max_xref_entries;
         Reader {
             buffer,
             document: Document::new(),
@@ -106,7 +108,7 @@ impl Document {
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
         }
-        .read(options.filter)
+        .read_with_xref_entry_limit(options.filter, max_xref_entries)
     }
 
     /// Load a PDF document from a memory slice with a password for encrypted PDFs.
@@ -222,6 +224,7 @@ impl Document {
 
         let mut buffer = capacity.map(Vec::with_capacity).unwrap_or_default();
         source.read_to_end(&mut buffer).await?;
+        let max_xref_entries = options.max_xref_entries;
 
         Reader {
             buffer: &buffer,
@@ -232,7 +235,7 @@ impl Document {
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
         }
-        .read(options.filter)
+        .read_with_xref_entry_limit(options.filter, max_xref_entries)
     }
 
     /// Load a PDF document from a memory slice.
@@ -242,6 +245,7 @@ impl Document {
 
     /// Load a PDF document from a memory slice with the given options.
     pub fn load_mem_with_options(buffer: &[u8], options: LoadOptions) -> Result<Document> {
+        let max_xref_entries = options.max_xref_entries;
         Reader {
             buffer,
             document: Document::new(),
@@ -251,7 +255,7 @@ impl Document {
             strict: options.strict,
             max_decompressed_size: options.max_decompressed_size,
         }
-        .read(options.filter)
+        .read_with_xref_entry_limit(options.filter, max_xref_entries)
     }
 
     /// Load PDF metadata (title and page count) without loading the entire document.
@@ -573,7 +577,7 @@ impl Reader<'_> {
             return Err(Error::Xref(XrefError::Start));
         }
 
-        let (mut xref, mut trailer) = self.xref_and_trailer_at(xref_start)?;
+        let (mut xref, mut trailer) = self.xref_and_trailer_at(xref_start, None)?;
 
         let mut already_seen = HashSet::new();
         let mut prev_xref_start = trailer.remove(b"Prev");
@@ -586,7 +590,7 @@ impl Reader<'_> {
                 return Err(Error::Xref(XrefError::PrevStart));
             }
 
-            let (prev_xref, prev_trailer) = self.xref_and_trailer_at(prev as usize)?;
+            let (prev_xref, prev_trailer) = self.xref_and_trailer_at(prev as usize, None)?;
             xref.merge(prev_xref);
 
             let prev_xref_stream_start = trailer.remove(b"XRefStm");
@@ -595,7 +599,7 @@ impl Reader<'_> {
                     return Err(Error::Xref(XrefError::StreamStart));
                 }
 
-                let (prev_xref, _) = self.xref_and_trailer_at(prev as usize)?;
+                let (prev_xref, _) = self.xref_and_trailer_at(prev as usize, None)?;
                 xref.merge(prev_xref);
             }
 
@@ -786,7 +790,13 @@ impl Reader<'_> {
     }
 
     /// Read whole document.
-    pub fn read(mut self, filter_func: Option<FilterFunc>) -> Result<Document> {
+    pub fn read(self, filter_func: Option<FilterFunc>) -> Result<Document> {
+        self.read_with_xref_entry_limit(filter_func, None)
+    }
+
+    fn read_with_xref_entry_limit(
+        mut self, filter_func: Option<FilterFunc>, max_xref_entries: Option<usize>,
+    ) -> Result<Document> {
         let offset = self.buffer.windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
         self.buffer = &self.buffer[offset..];
 
@@ -810,7 +820,7 @@ impl Reader<'_> {
         let xref_start = self.correct_xref_offset(xref_start);
         self.document.xref_start = xref_start;
 
-        let (mut xref, mut trailer) = self.xref_and_trailer_at(xref_start)?;
+        let (mut xref, mut trailer) = self.xref_and_trailer_at(xref_start, max_xref_entries)?;
 
         // Read previous Xrefs of linearized or incremental updated document.
         let mut already_seen = HashSet::new();
@@ -824,8 +834,8 @@ impl Reader<'_> {
                 return Err(Error::Xref(XrefError::PrevStart));
             }
 
-            let (prev_xref, prev_trailer) = self.xref_and_trailer_at(prev as usize)?;
-            xref.merge(prev_xref);
+            let (prev_xref, prev_trailer) = self.xref_and_trailer_at(prev as usize, max_xref_entries)?;
+            Self::merge_xref(&mut xref, prev_xref, max_xref_entries)?;
 
             // Read xref stream in hybrid-reference file
             let prev_xref_stream_start = trailer.remove(b"XRefStm");
@@ -834,8 +844,8 @@ impl Reader<'_> {
                     return Err(Error::Xref(XrefError::StreamStart));
                 }
 
-                let (prev_xref, _) = self.xref_and_trailer_at(prev as usize)?;
-                xref.merge(prev_xref);
+                let (prev_xref, _) = self.xref_and_trailer_at(prev as usize, max_xref_entries)?;
+                Self::merge_xref(&mut xref, prev_xref, max_xref_entries)?;
             }
 
             prev_xref_start = prev_trailer.get(b"Prev").cloned().ok();
@@ -1327,9 +1337,32 @@ impl Reader<'_> {
 
     /// Parse the cross-reference section recorded at `offset`, first correcting
     /// the offset if it is slightly miswritten (lenient mode only).
-    fn xref_and_trailer_at(&self, offset: usize) -> Result<(Xref, Dictionary)> {
+    fn xref_and_trailer_at(&self, offset: usize, max_xref_entries: Option<usize>) -> Result<(Xref, Dictionary)> {
         let offset = self.correct_xref_offset(offset);
-        parser::xref_and_trailer(&self.buffer[offset..], self)
+        parser::xref_and_trailer(&self.buffer[offset..], self, max_xref_entries)
+    }
+
+    fn merge_xref(xref: &mut Xref, incoming: Xref, max_xref_entries: Option<usize>) -> Result<()> {
+        let additional_entries = incoming
+            .entries
+            .keys()
+            .filter(|id| !xref.entries.contains_key(*id))
+            .try_fold(0_usize, |count, _| count.checked_add(1))
+            .ok_or(ParseError::InvalidXref)?;
+        let merged_entries = xref
+            .entries
+            .len()
+            .checked_add(additional_entries)
+            .ok_or(ParseError::InvalidXref)?;
+        if let Some(limit) = max_xref_entries
+            && merged_entries > limit
+        {
+            return Err(ParseError::XrefEntryLimitExceeded { limit }.into());
+        }
+
+        xref.merge(incoming);
+        debug_assert_eq!(xref.entries.len(), merged_entries);
+        Ok(())
     }
 
     /// Some generators write `startxref` (or trailer `Prev`) values that are

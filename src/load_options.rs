@@ -49,6 +49,16 @@ pub struct LoadOptions {
     ///
     /// `None` (the default) applies no limit.
     pub max_decompressed_size: Option<usize>,
+    /// Maximum number of cross-reference records accepted while loading.
+    ///
+    /// This bounds both the records declared by an individual cross-reference
+    /// table or stream and the unique entries retained while following
+    /// incremental-update chains. It complements `max_decompressed_size`:
+    /// narrow cross-reference records can trigger many map insertions without
+    /// requiring a comparably large decoded stream.
+    ///
+    /// `None` (the default) applies no limit.
+    pub max_xref_entries: Option<usize>,
 }
 
 impl std::fmt::Debug for LoadOptions {
@@ -58,6 +68,7 @@ impl std::fmt::Debug for LoadOptions {
             .field("filter", &self.filter.map(|_| "fn(..)"))
             .field("strict", &self.strict)
             .field("max_decompressed_size", &self.max_decompressed_size)
+            .field("max_xref_entries", &self.max_xref_entries)
             .finish()
     }
 }
@@ -85,6 +96,15 @@ impl LoadOptions {
     pub fn with_max_decompressed_size(max_decompressed_size: usize) -> Self {
         Self {
             max_decompressed_size: Some(max_decompressed_size),
+            ..Default::default()
+        }
+    }
+
+    /// Create options that bound cross-reference records accepted during
+    /// loading. See [`LoadOptions::max_xref_entries`].
+    pub fn with_max_xref_entries(max_xref_entries: usize) -> Self {
+        Self {
+            max_xref_entries: Some(max_xref_entries),
             ..Default::default()
         }
     }

@@ -3,9 +3,13 @@
 //! declared count is allowed to run past what the body can hold, `load` spins on
 //! an attacker-controlled number instead of the bytes actually present.
 
-#![cfg(not(feature = "async"))]
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use lopdf::{Document, Error, ParseError, SaveOptions, Stream, dictionary};
+use flate2::{Compression, write::ZlibEncoder};
+use lopdf::{Document, Error, LoadOptions, Object, ParseError, SaveOptions, Stream, dictionary};
+
+static OBJECT_FILTER_CALLED: AtomicBool = AtomicBool::new(false);
 
 /// A PDF whose only cross-reference is an xref stream with the given `/W` widths,
 /// `/Index [0 count]`, and `body` as an uncompressed stream body.
@@ -29,6 +33,114 @@ fn xref_stream_pdf(w: [i64; 3], count: i64, body: &[u8]) -> Vec<u8> {
     pdf.extend_from_slice(b"\nendstream\nendobj\n");
     pdf.extend_from_slice(format!("startxref\n{obj_offset}\n%%EOF").as_bytes());
     pdf
+}
+
+fn compressed_xref_stream_pdf(entry_count: usize) -> Vec<u8> {
+    assert!(entry_count >= 3);
+
+    let mut pdf = b"%PDF-1.5\n".to_vec();
+    let catalog_offset = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let xref_offset = pdf.len();
+
+    let mut body = Vec::with_capacity(entry_count * 7);
+    for id in 0..entry_count {
+        let (entry_type, field_two, field_three) = match id {
+            0 => (0, 0, u16::MAX),
+            1 => (1, catalog_offset as u32, 0),
+            2 => (1, xref_offset as u32, 0),
+            _ => (0, 0, 0),
+        };
+        body.push(entry_type);
+        body.extend_from_slice(&field_two.to_be_bytes());
+        body.extend_from_slice(&field_three.to_be_bytes());
+    }
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&body).unwrap();
+    let compressed_body = encoder.finish().unwrap();
+
+    pdf.extend_from_slice(b"2 0 obj\n");
+    pdf.extend_from_slice(
+        format!(
+            "<< /Type /XRef /Size {entry_count} /W [1 4 2] /Index [0 {entry_count}] \
+             /Root 1 0 R /Filter /FlateDecode /Length {} >>\n",
+            compressed_body.len()
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(b"stream\n");
+    pdf.extend_from_slice(&compressed_body);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    pdf.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF").as_bytes());
+    pdf
+}
+
+fn classic_xref_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let catalog_offset = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+    pdf.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    pdf.extend_from_slice(b"trailer\n<< /Size 2 /Root 1 0 R >>\n");
+    pdf.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF").as_bytes());
+    pdf
+}
+
+fn incremental_xref_pdf(replace_existing_object: bool) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let object_one_offset = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let object_two_offset = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n42\nendobj\n");
+
+    let first_xref_offset = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+    pdf.extend_from_slice(format!("{object_one_offset:010} 00000 n \n").as_bytes());
+    pdf.extend_from_slice(format!("{object_two_offset:010} 00000 n \n").as_bytes());
+    pdf.extend_from_slice(b"trailer\n<< /Size 3 /Root 1 0 R >>\n");
+    pdf.extend_from_slice(format!("startxref\n{first_xref_offset}\n%%EOF\n").as_bytes());
+
+    let next_object_offset = pdf.len();
+    if replace_existing_object {
+        pdf.extend_from_slice(b"2 0 obj\n43\nendobj\n");
+    } else {
+        pdf.extend_from_slice(b"3 0 obj\n43\nendobj\n");
+    }
+    let second_object_offset = pdf.len();
+    if !replace_existing_object {
+        pdf.extend_from_slice(b"4 0 obj\n44\nendobj\n");
+    }
+
+    let second_xref_offset = pdf.len();
+    if replace_existing_object {
+        pdf.extend_from_slice(b"xref\n2 1\n");
+        pdf.extend_from_slice(format!("{next_object_offset:010} 00000 n \n").as_bytes());
+    } else {
+        pdf.extend_from_slice(b"xref\n3 2\n");
+        pdf.extend_from_slice(format!("{next_object_offset:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{second_object_offset:010} 00000 n \n").as_bytes());
+    }
+    let size = if replace_existing_object { 3 } else { 5 };
+    pdf.extend_from_slice(format!("trailer\n<< /Size {size} /Root 1 0 R /Prev {first_xref_offset} >>\n").as_bytes());
+    pdf.extend_from_slice(format!("startxref\n{second_xref_offset}\n%%EOF").as_bytes());
+    pdf
+}
+
+fn assert_xref_limit_exceeded<T: std::fmt::Debug>(result: lopdf::Result<T>, expected_limit: usize) {
+    assert!(
+        matches!(
+            result,
+            Err(Error::Parse(ParseError::XrefEntryLimitExceeded { limit })) if limit == expected_limit
+        ),
+        "expected the {expected_limit}-entry xref limit to be exceeded, got {result:?}"
+    );
+}
+
+fn record_object_filter(id: (u32, u16), object: &mut Object) -> Option<((u32, u16), Object)> {
+    OBJECT_FILTER_CALLED.store(true, Ordering::SeqCst);
+    Some((id, object.clone()))
 }
 
 // With `/W [0 0 0]` every entry reads zero bytes, so before the bound the loop ran
@@ -60,6 +172,57 @@ fn index_count_past_stream_length_is_rejected() {
         Err(other) => panic!("expected InvalidXref, got {other:?}"),
         Ok(_) => panic!("an /Index count far past the stream length was accepted"),
     }
+}
+
+#[test]
+fn configured_limit_bounds_xref_stream_entries() {
+    let pdf = compressed_xref_stream_pdf(4);
+
+    assert_xref_limit_exceeded(
+        Document::load_mem_with_options(&pdf, LoadOptions::with_max_xref_entries(3)),
+        3,
+    );
+    Document::load_mem_with_options(&pdf, LoadOptions::with_max_xref_entries(4))
+        .expect("an xref stream at the configured limit should load");
+}
+
+#[test]
+fn configured_limit_bounds_classic_xref_entries() {
+    let pdf = classic_xref_pdf();
+
+    assert_xref_limit_exceeded(
+        Document::load_mem_with_options(&pdf, LoadOptions::with_max_xref_entries(1)),
+        1,
+    );
+    Document::load_mem_with_options(&pdf, LoadOptions::with_max_xref_entries(2))
+        .expect("a classic xref table at the configured limit should load");
+}
+
+#[test]
+fn configured_limit_bounds_incremental_xref_union() {
+    let pdf = incremental_xref_pdf(false);
+
+    OBJECT_FILTER_CALLED.store(false, Ordering::SeqCst);
+    let options = LoadOptions {
+        filter: Some(record_object_filter),
+        max_xref_entries: Some(3),
+        ..Default::default()
+    };
+    assert_xref_limit_exceeded(Document::load_mem_with_options(&pdf, options), 3);
+    assert!(
+        !OBJECT_FILTER_CALLED.load(Ordering::SeqCst),
+        "objects must not be parsed before the cumulative xref limit is enforced"
+    );
+    Document::load_mem_with_options(&pdf, LoadOptions::with_max_xref_entries(4))
+        .expect("the unique xref union at the configured limit should load");
+}
+
+#[test]
+fn incremental_replacement_does_not_consume_another_union_entry() {
+    let pdf = incremental_xref_pdf(true);
+
+    Document::load_mem_with_options(&pdf, LoadOptions::with_max_xref_entries(3))
+        .expect("replacing an existing object ID should not grow the retained xref union");
 }
 
 // The bound is derived from the real per-entry width, so a genuine xref stream
