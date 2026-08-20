@@ -1,4 +1,4 @@
-use lopdf::{Document, Object, ObjectStream, SaveOptions, Stream, dictionary};
+use lopdf::{Document, Error, Object, ObjectStream, SaveOptions, Stream, dictionary};
 
 #[test]
 fn test_object_stream_parse_empty() {
@@ -13,6 +13,47 @@ fn test_object_stream_parse_empty() {
 
     let obj_stream = ObjectStream::new(&mut stream).unwrap();
     assert_eq!(obj_stream.objects.len(), 0);
+}
+
+#[test]
+fn test_object_stream_parse_preserves_encoded_content() {
+    let decoded = b"1 0 << /Kind /ArchiveEntry /Padding (aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa) >>";
+    let mut stream = Stream::new(
+        dictionary! {
+            "Type" => "ObjStm",
+            "N" => 1,
+            "First" => 4,
+        },
+        decoded.to_vec(),
+    );
+    stream.compress().unwrap();
+    let encoded = stream.content.clone();
+
+    let object_stream = ObjectStream::new_with_limit(&mut stream, Some(decoded.len())).unwrap();
+
+    assert!(object_stream.objects.contains_key(&(1, 0)));
+    assert_eq!(stream.content, encoded);
+    assert_eq!(stream.dict.get(b"Filter").unwrap().as_name().unwrap(), b"FlateDecode");
+}
+
+#[test]
+fn test_object_stream_parse_reports_unsupported_filters_without_mutating_input() {
+    let encoded = b"1 0 << >>".to_vec();
+    let mut stream = Stream::new(
+        dictionary! {
+            "Type" => "ObjStm",
+            "N" => 1,
+            "First" => 4,
+            "Filter" => "DCTDecode",
+        },
+        encoded.clone(),
+    );
+
+    let result = ObjectStream::new(&mut stream);
+
+    assert!(matches!(result, Err(Error::Unimplemented("decompression algorithms"))));
+    assert_eq!(stream.content, encoded);
+    assert_eq!(stream.dict.get(b"Filter").unwrap().as_name().unwrap(), b"DCTDecode");
 }
 
 #[test]
