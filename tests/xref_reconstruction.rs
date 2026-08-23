@@ -1,7 +1,6 @@
 use lopdf::{Document, LoadOptions, Object};
 
-/// Append `bodies` as consecutive top-level objects, returning each object's
-/// `(number, physical offset)` including the file header's width.
+/// Append objects, returning each one's `(number, physical offset)`.
 fn append_objects(pdf: &mut Vec<u8>, bodies: &[(u32, u16, String)]) -> Vec<(u32, usize)> {
     let mut offsets = Vec::new();
     for (number, generation, body) in bodies {
@@ -11,9 +10,8 @@ fn append_objects(pdf: &mut Vec<u8>, bodies: &[(u32, u16, String)]) -> Vec<(u32,
     offsets
 }
 
-/// Append a classic cross-reference table, trailer, and `startxref` line that
-/// records `startxref_value` — tests pass deliberately broken values to force
-/// the reconstruction fallback.
+/// Append a cross-reference table and trailer whose `startxref` records
+/// `startxref_value` (tests pass broken values to force the fallback).
 fn append_xref_trailer(pdf: &mut Vec<u8>, offsets: &[(u32, usize)], trailer: &str, startxref_value: usize) {
     pdf.extend_from_slice(b"xref\n");
     pdf.extend_from_slice(format!("0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes());
@@ -23,8 +21,8 @@ fn append_xref_trailer(pdf: &mut Vec<u8>, offsets: &[(u32, usize)], trailer: &st
     pdf.extend_from_slice(format!("trailer\n{trailer}\nstartxref\n{startxref_value}\n%%EOF\n").as_bytes());
 }
 
-/// A one-page document whose content stream embeds two object-like decoy
-/// tokens (`99 88 objx`, `1 2 objects`) that must never become markers.
+/// One-page document whose content stream embeds object-like decoy tokens
+/// (`99 88 objx`, `1 2 objects`) that must never become markers.
 fn sample_bodies() -> Vec<(u32, u16, String)> {
     let contents = b"BT /F1 12 Tf 20 100 Td (Hello World) Tj (99 88 objx) Tj (1 2 objects) Tj ET";
     vec![
@@ -62,11 +60,8 @@ fn startxref_past_eof_is_reconstructed_from_object_markers() {
     assert_eq!(document.get_pages().len(), 1);
     assert!(document.trailer.get(b"Root").is_ok());
 
-    // The object-like tokens inside the content stream must not have become
-    // markers shadowing or inventing objects.
     assert!(document.get_object((99, 0)).is_err());
 
-    // The metadata-only loader shares the same fallback.
     let metadata = Document::load_metadata_mem(&pdf).unwrap();
     assert_eq!(metadata.page_count, 1);
 }
@@ -87,9 +82,7 @@ fn strict_mode_does_not_reconstruct() {
 
 #[test]
 fn startxref_pointing_into_a_stream_falls_back_to_reconstruction() {
-    // The pointer lands mid-payload of object 4's content stream, more than a
-    // recovery window away from any xref keyword, so neither the standard
-    // resolution nor the slight-offset correction can succeed.
+    // Pointer lands mid-payload, beyond the correction window.
     let mut pdf = new_pdf();
     let offsets = append_objects(&mut pdf, &sample_bodies());
     let payload = pdf.windows(7).position(|window| window == b"stream\n").unwrap() + 7;
@@ -105,9 +98,7 @@ fn startxref_pointing_into_a_stream_falls_back_to_reconstruction() {
 
 #[test]
 fn reconstruction_prefers_newer_revisions_of_duplicated_objects() {
-    // Two revisions appended like an incremental update; the second redefines
-    // object 2 and its `startxref` is corrupted. The scan meets both headers
-    // and must keep the later one, along with the later trailer.
+    // A second revision redefines object 2; its startxref is corrupted.
     let mut pdf = new_pdf();
     let mut offsets = append_objects(&mut pdf, &sample_bodies());
     let first_startxref = pdf.len();
@@ -137,8 +128,7 @@ fn reconstruction_prefers_newer_revisions_of_duplicated_objects() {
 
 #[test]
 fn reconstruction_skips_trailers_whose_root_was_not_found() {
-    // A trailing bogus revision references catalog object 77, which does not
-    // exist; reconstruction must walk back to the trailer with a usable Root.
+    // A trailing bogus trailer references absent catalog object 77.
     let mut pdf = new_pdf();
     let offsets = append_objects(&mut pdf, &sample_bodies());
     let broken_startxref = pdf.len() + 4096;
@@ -152,8 +142,6 @@ fn reconstruction_skips_trailers_whose_root_was_not_found() {
 
 #[test]
 fn reconstruction_fails_when_no_trailer_has_a_usable_root() {
-    // Without any parsable `/Root` there is nothing to recover to; the
-    // original resolution error must surface instead.
     let mut pdf = new_pdf();
     append_objects(&mut pdf, &sample_bodies());
     pdf.extend_from_slice(b"trailer\n<< /Size 5 >>\n");
