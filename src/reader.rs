@@ -824,6 +824,13 @@ impl Reader<'_> {
             self.load_objects_raw(filter_func)?;
         }
 
+        // Object-stream members join `objects` only during loading, after
+        // `max_id` was derived from the xref size. Keep the ceiling at least
+        // at the highest loaded object so new ids cannot collide with live ones.
+        if let Some(&max_loaded_id) = self.document.objects.keys().next_back() {
+            self.document.max_id = self.document.max_id.max(max_loaded_id.0);
+        }
+
         Ok(self.document)
     }
 
@@ -1420,11 +1427,15 @@ impl Reader<'_> {
             // Incremental updates append, so later revisions win.
             xref.insert(number, XrefEntry::Normal { offset, generation });
         }
+        // Normalize like `resolve_xref_and_trailer`: size spans object numbers
+        // up to the highest, not physical copies across incremental updates.
+        xref.size = xref.max_id().saturating_add(1);
 
         let (_trailer_pos, trailer) = self.find_latest_trailer(&xref)?;
-        // deliberate: end-of-file, since each scanned offset carries its own
-        // read boundary and there is no real on-disk table to point at.
-        self.document.xref_start = self.buffer.len();
+        // deliberate: no on-disk table exists to point at. Zero marks the
+        // offset "unknown" so `Document::new_from_prev` omits `/Prev` instead
+        // of recording end-of-file; `object_end` clamps to the buffer either way.
+        self.document.xref_start = 0;
 
         warn!(
             "reconstructed cross-reference table with {} objects by scanning for indirect objects",
@@ -1434,24 +1445,137 @@ impl Reader<'_> {
     }
 
     /// Collect `(offset, id)` of every indirect-object header in one pass.
+    /// Only headers starting a line (optional leading blanks allowed) count,
+    /// stream payloads are skipped wholesale, and object numbers beyond
+    /// [`MAX_RECONSTRUCTED_OBJECTS`] are rejected so a forged header can
+    /// neither shadow a genuine entry nor poison the reconstructed size.
     fn scan_object_markers(buffer: &[u8]) -> Vec<(u32, ObjectId)> {
+        const STREAM_KEYWORD: &[u8] = b"stream";
+        const END_STREAM_KEYWORD: &[u8] = b"endstream";
+
         let mut markers = Vec::new();
-        for pos in 0..buffer.len() {
-            // Anchor at digit-run starts to avoid overlapping matches.
-            if !buffer[pos].is_ascii_digit() || pos > 0 && buffer[pos - 1].is_ascii_digit() {
-                continue;
-            }
-            if let Some(id) = Self::parse_object_header(&buffer[pos..]) {
-                if markers.len() == MAX_RECONSTRUCTED_OBJECTS {
-                    warn!(
-                        "object marker scan stopped at the {MAX_RECONSTRUCTED_OBJECTS}-marker cap; reconstruction may be incomplete"
-                    );
-                    break;
+        let mut oversized_number_warned = false;
+        let mut at_line_start = true;
+        let mut pos = 0;
+        while pos < buffer.len() {
+            // Skip raw stream data: an uncompressed payload may embed
+            // convincing `N G obj` lines whose later offsets would otherwise
+            // override the genuine entries for those object numbers.
+            if buffer[pos..].starts_with(STREAM_KEYWORD)
+                && !buffer[..pos].ends_with(b"end")
+                && matches!(buffer.get(pos + STREAM_KEYWORD.len()), Some(b'\r' | b'\n'))
+            {
+                let after_keyword = pos + STREAM_KEYWORD.len();
+                if let Some(relative) = buffer[after_keyword..]
+                    .windows(END_STREAM_KEYWORD.len())
+                    .position(|window| window == END_STREAM_KEYWORD)
+                {
+                    pos = after_keyword + relative + END_STREAM_KEYWORD.len();
+                    at_line_start = false;
+                    continue;
                 }
-                markers.push((pos as u32, id));
+                // Damaged stream without terminator: fall back to the
+                // dictionary's /Length hint so the payload cannot hide
+                // line-start pseudo headers, while objects written after it
+                // stay reachable.
+                if let Some(resume) = Self::payload_end_by_length(buffer, pos) {
+                    pos = resume;
+                    at_line_start = false;
+                    continue;
+                }
+                // Unusable /Length too: nothing bounds the payload, so keep
+                // scanning byte by byte rather than dropping what follows.
             }
+            // Anchor at line starts so pseudo headers buried after another
+            // token (string literal, comment) are never mistaken for markers.
+            if at_line_start
+                && buffer[pos].is_ascii_digit()
+                && let Some(id) = Self::parse_object_header(&buffer[pos..])
+            {
+                // A huge bogus number would inflate `size` (and thus
+                // `max_id`) via `Xref::insert`; genuine numbering stays
+                // within the same cap as the marker count.
+                if id.0 > MAX_RECONSTRUCTED_OBJECTS as u32 {
+                    if !oversized_number_warned {
+                        warn!("ignoring object headers numbered above {MAX_RECONSTRUCTED_OBJECTS}");
+                        oversized_number_warned = true;
+                    }
+                } else {
+                    if markers.len() == MAX_RECONSTRUCTED_OBJECTS {
+                        warn!(
+                            "object marker scan stopped at the {MAX_RECONSTRUCTED_OBJECTS}-marker cap; reconstruction may be incomplete"
+                        );
+                        break;
+                    }
+                    markers.push((pos as u32, id));
+                }
+            }
+            match buffer[pos] {
+                b'\r' | b'\n' => at_line_start = true,
+                b' ' | b'\t' => {}
+                _ => at_line_start = false,
+            }
+            pos += 1;
         }
         markers
+    }
+
+    /// Resume offset past a stream payload according to a *direct* `/Length`
+    /// integer in the dictionary preceding the `stream` keyword at
+    /// `stream_pos`. The search is scoped to the current object (after the
+    /// nearest preceding `obj` keyword) so a missing `/Length` cannot latch
+    /// onto a previous object's value. Returns `None` when the hint is
+    /// absent, indirect, or points outside the buffer — damaged files tend
+    /// to carry wrong `/Length` values, so it must stay a hint, never a hard
+    /// boundary.
+    fn payload_end_by_length(buffer: &[u8], stream_pos: usize) -> Option<usize> {
+        const LENGTH_KEY: &[u8] = b"/Length";
+        const OBJ_KEYWORD: &[u8] = b"obj";
+        const STREAM_KEYWORD_LEN: usize = b"stream".len();
+
+        let head = &buffer[..stream_pos];
+        let obj_pos = head
+            .windows(OBJ_KEYWORD.len())
+            .rposition(|window| window == OBJ_KEYWORD)?;
+        let dict_region = &buffer[obj_pos + OBJ_KEYWORD.len()..stream_pos];
+        // Nearest `/Length` in this object's dictionary; parsing it validates
+        // that the match really is a key with an integer value.
+        let key_pos = dict_region
+            .windows(LENGTH_KEY.len())
+            .rposition(|window| window == LENGTH_KEY)?;
+        let rest = &dict_region[key_pos + LENGTH_KEY.len()..];
+        let digits_start = rest.iter().position(u8::is_ascii_digit)?;
+        let digits_len = rest[digits_start..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits_len > 10 {
+            return None;
+        }
+        // An indirect reference (`/Length 5 0 R`) continues with another
+        // number token; a direct integer ends at a name, `>>`, or the keyword.
+        match rest[digits_start + digits_len..]
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace())
+        {
+            Some(b'/') | Some(b'>') => {}
+            _ => return None,
+        }
+        let length: usize = std::str::from_utf8(&rest[digits_start..digits_start + digits_len])
+            .ok()?
+            .parse()
+            .ok()?;
+        // Spec: the EOL after the `stream` keyword counts as CRLF or LF.
+        let eol_len = match (
+            buffer.get(stream_pos + STREAM_KEYWORD_LEN),
+            buffer.get(stream_pos + STREAM_KEYWORD_LEN + 1),
+        ) {
+            (Some(b'\r'), Some(b'\n')) => 2,
+            _ => 1,
+        };
+        let end = (stream_pos + STREAM_KEYWORD_LEN + eol_len).checked_add(length)?;
+        (buffer.len() >= end).then_some(end)
     }
 
     /// Parse an `N G obj` header; the byte after `obj` must end the token.

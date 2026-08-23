@@ -78,7 +78,11 @@ impl Document {
     /// Create a new PDF document that is an incremental update to a previous document.
     pub fn new_from_prev(prev: &Document) -> Self {
         let mut new_trailer = prev.trailer.clone();
-        new_trailer.set("Prev", Object::Integer(prev.xref_start as i64));
+        // A zero xref_start marks a document with no known on-disk table
+        // (e.g. recovered by scanning); emitting `/Prev 0` would corrupt the chain.
+        if prev.xref_start != 0 {
+            new_trailer.set("Prev", Object::Integer(prev.xref_start as i64));
+        }
         Self {
             version: "1.4".to_string(),
             binary_mark: vec![0xBB, 0xAD, 0xC0, 0xDE],
