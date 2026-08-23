@@ -24,7 +24,7 @@ use crate::error::{ParseError, XrefError};
 use crate::load_options::{FilterFunc, LoadOptions};
 use crate::object_stream::ObjectStream;
 use crate::parser;
-use crate::xref::{Xref, XrefEntry};
+use crate::xref::{Xref, XrefEntry, XrefType};
 use crate::{Dictionary, Document, Error, IncrementalDocument, Object, ObjectId, Result};
 
 #[cfg(not(feature = "async"))]
@@ -493,6 +493,16 @@ pub const MAX_BRACKET: usize = 100;
 
 pub const MAX_NESTING_DEPTH: usize = 100;
 
+/// Hard cap on the number of indirect-object headers collected while
+/// reconstructing a cross-reference table from raw bytes. The scan is already
+/// bounded by input length; this bounds the memory of the rebuilt table when a
+/// hostile file consists almost entirely of `N G obj` byte sequences.
+const MAX_RECONSTRUCTED_OBJECTS: usize = 1_000_000;
+
+/// Hard cap on how many trailing `trailer` dictionaries cross-reference
+/// reconstruction inspects while looking for one with a usable `/Root`.
+const MAX_TRAILER_CANDIDATES: usize = 16;
+
 /// PDF metadata extracted without loading the entire document.
 /// This is useful for quickly getting basic information about large PDFs.
 #[derive(Debug, Clone)]
@@ -587,47 +597,18 @@ impl Reader<'_> {
 
         let version = parser::header(self.buffer, self.strict).ok_or(ParseError::InvalidFileHeader)?;
 
-        let xref_start = Self::get_xref_start(self.buffer)?;
-        if xref_start > self.buffer.len() {
-            return Err(Error::Xref(XrefError::Start));
-        }
-
-        let (mut xref, mut trailer) = self.xref_and_trailer_at(xref_start)?;
-
-        let mut already_seen = HashSet::new();
-        let mut prev_xref_start = trailer.remove(b"Prev");
-        while let Some(prev) = prev_xref_start.and_then(|offset| offset.as_i64().ok()) {
-            if already_seen.contains(&prev) {
-                break;
-            }
-            already_seen.insert(prev);
-            if prev < 0 || prev as usize > self.buffer.len() {
-                return Err(Error::Xref(XrefError::PrevStart));
-            }
-
-            let (prev_xref, prev_trailer) = self.xref_and_trailer_at(prev as usize)?;
-            xref.merge(prev_xref);
-
-            let prev_xref_stream_start = trailer.remove(b"XRefStm");
-            if let Some(prev) = prev_xref_stream_start.and_then(|offset| offset.as_i64().ok()) {
-                if prev < 0 || prev as usize > self.buffer.len() {
-                    return Err(Error::Xref(XrefError::StreamStart));
+        // Same resolution order as `read`, including the brute-force
+        // reconstruction fallback.
+        let (xref, trailer) = match self.resolve_xref_and_trailer() {
+            Ok(resolved) => resolved,
+            Err(err) => match self.reconstruct_xref_and_trailer() {
+                Some(reconstructed) => {
+                    warn!("cross-reference resolution failed ({err}); recovered by scanning for indirect objects");
+                    reconstructed
                 }
-
-                let (prev_xref, _) = self.xref_and_trailer_at(prev as usize)?;
-                xref.merge(prev_xref);
-            }
-
-            prev_xref_start = prev_trailer.get(b"Prev").cloned().ok();
-        }
-        let xref_entry_count = xref.max_id().checked_add(1).ok_or(ParseError::InvalidXref)?;
-        if xref.size != xref_entry_count {
-            warn!(
-                "Size entry of trailer dictionary is {}, correct value is {}.",
-                xref.size, xref_entry_count
-            );
-            xref.size = xref_entry_count;
-        }
+                None => return Err(err),
+            },
+        };
 
         self.set_reference_table(xref);
         self.document.trailer = trailer.clone();
@@ -821,51 +802,21 @@ impl Reader<'_> {
             self.document.binary_mark = binary_mark;
         }
 
-        let xref_start = Self::get_xref_start(self.buffer)?;
-        if xref_start > self.buffer.len() {
-            return Err(Error::Xref(XrefError::Start));
-        }
-        let xref_start = self.correct_xref_offset(xref_start);
-        self.document.xref_start = xref_start;
-
-        let (mut xref, mut trailer) = self.xref_and_trailer_at(xref_start)?;
-
-        // Read previous Xrefs of linearized or incremental updated document.
-        let mut already_seen = HashSet::new();
-        let mut prev_xref_start = trailer.remove(b"Prev");
-        while let Some(prev) = prev_xref_start.and_then(|offset| offset.as_i64().ok()) {
-            if already_seen.contains(&prev) {
-                break;
-            }
-            already_seen.insert(prev);
-            if prev < 0 || prev as usize > self.buffer.len() {
-                return Err(Error::Xref(XrefError::PrevStart));
-            }
-
-            let (prev_xref, prev_trailer) = self.xref_and_trailer_at(prev as usize)?;
-            xref.merge(prev_xref);
-
-            // Read xref stream in hybrid-reference file
-            let prev_xref_stream_start = trailer.remove(b"XRefStm");
-            if let Some(prev) = prev_xref_stream_start.and_then(|offset| offset.as_i64().ok()) {
-                if prev < 0 || prev as usize > self.buffer.len() {
-                    return Err(Error::Xref(XrefError::StreamStart));
+        // Resolve the cross-reference table/stream and trailer following the
+        // standard order: `startxref`, slight-offset correction, then the
+        // `/Prev` and `/XRefStm` chain. Only if every step of that pipeline
+        // fails, fall back to reconstructing the table from object markers
+        // scanned in the raw bytes.
+        let (xref, trailer) = match self.resolve_xref_and_trailer() {
+            Ok(resolved) => resolved,
+            Err(err) => match self.reconstruct_xref_and_trailer() {
+                Some(reconstructed) => {
+                    warn!("cross-reference resolution failed ({err}); recovered by scanning for indirect objects");
+                    reconstructed
                 }
-
-                let (prev_xref, _) = self.xref_and_trailer_at(prev as usize)?;
-                xref.merge(prev_xref);
-            }
-
-            prev_xref_start = prev_trailer.get(b"Prev").cloned().ok();
-        }
-        let xref_entry_count = xref.max_id().checked_add(1).ok_or(ParseError::InvalidXref)?;
-        if xref.size != xref_entry_count {
-            warn!(
-                "Size entry of trailer dictionary is {}, correct value is {}.",
-                xref.size, xref_entry_count
-            );
-            xref.size = xref_entry_count;
-        }
+                None => return Err(err),
+            },
+        };
 
         self.document.version = version;
         self.document.max_id = xref.size - 1;
@@ -1407,6 +1358,198 @@ impl Reader<'_> {
         parser::xref_and_trailer(&self.buffer[offset..], self)
     }
 
+    /// Resolve the cross-reference table/stream and trailer dictionary,
+    /// including the `/Prev` chain of linearized or incrementally updated
+    /// documents, and record the resolved start offset on the document.
+    fn resolve_xref_and_trailer(&mut self) -> Result<(Xref, Dictionary)> {
+        let xref_start = Self::get_xref_start(self.buffer)?;
+        if xref_start > self.buffer.len() {
+            return Err(Error::Xref(XrefError::Start));
+        }
+        let xref_start = self.correct_xref_offset(xref_start);
+        self.document.xref_start = xref_start;
+
+        let (mut xref, mut trailer) = self.xref_and_trailer_at(xref_start)?;
+
+        // Read previous Xrefs of linearized or incremental updated document.
+        let mut already_seen = HashSet::new();
+        let mut prev_xref_start = trailer.remove(b"Prev");
+        while let Some(prev) = prev_xref_start.and_then(|offset| offset.as_i64().ok()) {
+            if already_seen.contains(&prev) {
+                break;
+            }
+            already_seen.insert(prev);
+            if prev < 0 || prev as usize > self.buffer.len() {
+                return Err(Error::Xref(XrefError::PrevStart));
+            }
+
+            let (prev_xref, prev_trailer) = self.xref_and_trailer_at(prev as usize)?;
+            xref.merge(prev_xref);
+
+            // Read xref stream in hybrid-reference file
+            let prev_xref_stream_start = trailer.remove(b"XRefStm");
+            if let Some(prev) = prev_xref_stream_start.and_then(|offset| offset.as_i64().ok()) {
+                if prev < 0 || prev as usize > self.buffer.len() {
+                    return Err(Error::Xref(XrefError::StreamStart));
+                }
+
+                let (prev_xref, _) = self.xref_and_trailer_at(prev as usize)?;
+                xref.merge(prev_xref);
+            }
+
+            prev_xref_start = prev_trailer.get(b"Prev").cloned().ok();
+        }
+        let xref_entry_count = xref.max_id().checked_add(1).ok_or(ParseError::InvalidXref)?;
+        if xref.size != xref_entry_count {
+            warn!(
+                "Size entry of trailer dictionary is {}, correct value is {}.",
+                xref.size, xref_entry_count
+            );
+            xref.size = xref_entry_count;
+        }
+
+        Ok((xref, trailer))
+    }
+
+    /// Last-resort recovery: rebuild a cross-reference table by scanning the
+    /// raw bytes for indirect-object headers (`N G obj`) and locating the
+    /// newest parsable `trailer` dictionary with a usable `/Root`. This mirrors
+    /// the reconstruction mode of pdf.js, qpdf, poppler and pypdf for files
+    /// whose `startxref`, cross-reference table or cross-reference stream
+    /// cannot be resolved at all.
+    ///
+    /// Object streams need no special treatment: their container objects are
+    /// ordinary top-level markers, so the regular loading pass decompresses
+    /// them once the rebuilt table points at the containers.
+    ///
+    /// Returns `None` when strict mode forbids recovery or nothing usable was
+    /// found; the caller then surfaces the original resolution error.
+    fn reconstruct_xref_and_trailer(&mut self) -> Option<(Xref, Dictionary)> {
+        if self.strict {
+            return None;
+        }
+        // `XrefEntry::Normal` offsets are u32; refuse inputs whose byte offsets
+        // cannot be represented instead of wrapping them.
+        u32::try_from(self.buffer.len()).ok()?;
+
+        let markers = Self::scan_object_markers(self.buffer);
+        if markers.is_empty() {
+            return None;
+        }
+
+        let mut xref = Xref::new(markers.len() as u32, XrefType::CrossReferenceTable);
+        for (offset, (number, generation)) in markers {
+            // Later revisions of an object win because incremental updates
+            // append, so the scan meets their headers last.
+            xref.insert(number, XrefEntry::Normal { offset, generation });
+        }
+
+        let (_trailer_pos, trailer) = self.find_latest_trailer(&xref)?;
+        // deliberate: record end-of-file rather than the trailer position.
+        // Every scanned marker provides its own boundary through the sorted
+        // offset index, so no object read must stop early, and no misleading
+        // `/Prev` target exists for a table that was never on disk.
+        self.document.xref_start = self.buffer.len();
+
+        warn!(
+            "reconstructed cross-reference table with {} objects by scanning for indirect objects",
+            xref.entries.len()
+        );
+        Some((xref, trailer))
+    }
+
+    /// Collect byte offsets and IDs of every indirect-object header
+    /// (`N G obj`) in the buffer with one left-to-right pass. Offsets come
+    /// from scan positions, never from numbers read out of the file, so the
+    /// result cannot be inflated by attacker-controlled values beyond the
+    /// [`MAX_RECONSTRUCTED_OBJECTS`] cap.
+    fn scan_object_markers(buffer: &[u8]) -> Vec<(u32, ObjectId)> {
+        let mut markers = Vec::new();
+        for pos in 0..buffer.len() {
+            // Anchor at digit-run starts so overlapping headers inside longer
+            // digit runs ("12 0 obj" vs "2 0 obj") match only once.
+            if !buffer[pos].is_ascii_digit() || pos > 0 && buffer[pos - 1].is_ascii_digit() {
+                continue;
+            }
+            if let Some(id) = Self::parse_object_header(&buffer[pos..]) {
+                if markers.len() == MAX_RECONSTRUCTED_OBJECTS {
+                    warn!(
+                        "object marker scan stopped at the {MAX_RECONSTRUCTED_OBJECTS}-marker cap; reconstruction may be incomplete"
+                    );
+                    break;
+                }
+                markers.push((pos as u32, id));
+            }
+        }
+        markers
+    }
+
+    /// Parse an indirect-object header (`N G obj`) at the start of `input`.
+    /// The byte following `obj` must be whitespace, a delimiter, or
+    /// end-of-input so tokens such as `objects` never match.
+    fn parse_object_header(input: &[u8]) -> Option<ObjectId> {
+        // deliberate: digit runs are capped at the widths of u32/u16; longer
+        // runs cannot be conforming object numbers but could be pathological
+        // padding whose per-position rescans would waste time.
+        fn digits(input: &[u8], cap: usize) -> Option<(&[u8], &[u8])> {
+            let n = input.iter().take_while(|b| b.is_ascii_digit()).count();
+            (0 < n && n <= cap).then(|| input.split_at(n))
+        }
+        fn spaces(input: &[u8]) -> Option<&[u8]> {
+            let n = input
+                .iter()
+                .take_while(|&&b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+                .count();
+            (n > 0).then(|| &input[n..])
+        }
+
+        let (number, rest) = digits(input, 10)?;
+        let number: u32 = std::str::from_utf8(number).ok()?.parse().ok()?;
+        let rest = spaces(rest)?;
+        let (generation, rest) = digits(rest, 5)?;
+        let generation: u16 = std::str::from_utf8(generation).ok()?.parse().ok()?;
+        let rest = spaces(rest)?;
+        let tail = rest.strip_prefix(b"obj")?;
+        match tail.first() {
+            None => {}
+            Some(&byte) if !byte.is_ascii_alphanumeric() => {}
+            _ => return None,
+        }
+        Some((number, generation))
+    }
+
+    /// Scan backwards for the newest parsable `trailer` dictionary whose
+    /// `/Root` entry references an object found by the marker scan; later
+    /// revisions win because incremental updates append their trailers.
+    /// Returns the keyword's byte position alongside the dictionary.
+    fn find_latest_trailer(&self, xref: &Xref) -> Option<(usize, Dictionary)> {
+        let mut bound = self.buffer.len();
+        for _ in 0..MAX_TRAILER_CANDIDATES {
+            let Some(pos) = Reader::search_substring(&self.buffer[..bound], b"trailer", 0) else {
+                break;
+            };
+            bound = pos;
+
+            let after_keyword = &self.buffer[pos + b"trailer".len()..];
+            let Some(dict_start) = after_keyword.iter().position(|byte| !byte.is_ascii_whitespace()) else {
+                continue;
+            };
+            let Ok((_, dict)) = parser::dictionary(&after_keyword[dict_start..]) else {
+                continue;
+            };
+            // A trailer is only usable when its catalog is among the scanned
+            // objects; otherwise keep looking in older revisions.
+            let root_is_present = dict
+                .get(b"Root")
+                .and_then(Object::as_reference)
+                .is_ok_and(|root| xref.entries.contains_key(&root.0));
+            if root_is_present {
+                return Some((pos, dict));
+            }
+        }
+        None
+    }
+
     /// Some generators write `startxref` (or trailer `Prev`) values that are
     /// slightly off — most commonly the offset of the line *after* the `xref`
     /// keyword instead of the keyword itself. Such files are otherwise intact,
@@ -1455,22 +1598,7 @@ impl Reader<'_> {
     /// Whether `input` begins with an indirect-object header (`N G obj`), the
     /// form a cross-reference stream starts with.
     fn starts_indirect_object(input: &[u8]) -> bool {
-        fn digits(input: &[u8]) -> Option<&[u8]> {
-            let n = input.iter().take_while(|b| b.is_ascii_digit()).count();
-            (n > 0).then(|| &input[n..])
-        }
-        fn spaces(input: &[u8]) -> Option<&[u8]> {
-            let n = input
-                .iter()
-                .take_while(|&&b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
-                .count();
-            (n > 0).then(|| &input[n..])
-        }
-        digits(input)
-            .and_then(spaces)
-            .and_then(digits)
-            .and_then(spaces)
-            .is_some_and(|rest| rest.starts_with(b"obj"))
+        Self::parse_object_header(input).is_some()
     }
 
     fn get_xref_start(buffer: &[u8]) -> Result<usize> {
@@ -1759,4 +1887,23 @@ startxref
     let loaded = Document::load_mem(doc.as_bytes()).unwrap();
     let stream = loaded.get_object((4, 0)).unwrap().as_stream().unwrap();
     assert_eq!(stream.content, b"BT /F1 12 Tf 20 100 Td (Hello World) Tj ET");
+}
+
+#[cfg(all(test, not(feature = "async")))]
+#[test]
+fn object_marker_parsing_accepts_only_real_headers() {
+    assert_eq!(Reader::parse_object_header(b"12 0 obj<<"), Some((12, 0)));
+    assert_eq!(Reader::parse_object_header(b"007 0 obj\n"), Some((7, 0)));
+    assert_eq!(Reader::parse_object_header(b"5 2 obj>>"), Some((5, 2)));
+    assert_eq!(Reader::parse_object_header(b"12\t3\r\nobj["), Some((12, 3)));
+
+    // The token after `obj` must not run into further letters or digits.
+    assert_eq!(Reader::parse_object_header(b"2 0 objects"), None);
+    assert_eq!(Reader::parse_object_header(b"99 88 objx"), None);
+    // Numbers beyond u32/u16 and malformed separators are rejected.
+    assert_eq!(Reader::parse_object_header(b"12345678901 0 obj"), None);
+    assert_eq!(Reader::parse_object_header(b"1 70000 obj"), None);
+    assert_eq!(Reader::parse_object_header(b"1 0obj"), None);
+    assert_eq!(Reader::parse_object_header(b"1  obj"), None);
+    assert_eq!(Reader::parse_object_header(b"x 0 obj"), None);
 }
