@@ -252,10 +252,7 @@ fn reconstructed_max_id_covers_object_stream_members() {
     let pages = b"<< /Type /Pages /Kids [6 0 R] /Count 1 >>";
     let page = b"<< /Type /Page /Parent 5 0 R /MediaBox [0 0 200 200] >>";
     let info = b"<< /Type /Info /Producer (x) >>";
-    let mut offsets = append_objects(
-        &mut pdf,
-        &[(1, 0, "<< /Type /Catalog /Pages 5 0 R >>".to_string())],
-    );
+    let mut offsets = append_objects(&mut pdf, &[(1, 0, "<< /Type /Catalog /Pages 5 0 R >>".to_string())]);
     let objstm_offset = pdf.len();
     append_objstm(&mut pdf, 2, &[(5, pages), (6, page), (7, info)]);
     offsets.push((2, objstm_offset));
@@ -305,9 +302,7 @@ fn reconstruction_bounds_unterminated_stream_by_its_length_hint() {
     let mut offsets = append_objects(&mut pdf, &page_tree_bodies());
     let payload = b"1 0 obj\n<< /Bogus true >>\nendobj\n";
     let fourth_offset = pdf.len();
-    pdf.extend_from_slice(
-        format!("4 0 obj\n<< /Length {} >>\nstream\n", payload.len()).as_bytes(),
-    );
+    pdf.extend_from_slice(format!("4 0 obj\n<< /Length {} >>\nstream\n", payload.len()).as_bytes());
     pdf.extend_from_slice(payload);
     pdf.extend_from_slice(b"endstrXXm\nendobj\n");
     offsets.push((4, fourth_offset));
@@ -349,14 +344,8 @@ fn reconstruction_accepts_indented_object_headers() {
     let second_offset = pdf.len();
     pdf.extend_from_slice(b" 2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
     let third_offset = pdf.len();
-    pdf.extend_from_slice(
-        b"\t3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>\nendobj\n",
-    );
-    let offsets = vec![
-        (1, first_offset),
-        (2, second_offset),
-        (3, third_offset),
-    ];
+    pdf.extend_from_slice(b"\t3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>\nendobj\n");
+    let offsets = vec![(1, first_offset), (2, second_offset), (3, third_offset)];
     let broken_startxref = pdf.len() + 4096;
     append_xref_trailer(&mut pdf, &offsets, "<< /Size 4 /Root 1 0 R >>", broken_startxref);
 
